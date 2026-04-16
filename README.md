@@ -142,4 +142,4 @@ Developed using TPUs provided by the Google TPU Research Cloud (TRC) program. Th
 
 ## License
 
-MIT. See `[LICENSE](https://github.com/emartin59/byte-multi-agent/blob/main/LICENSE)`.
+MIT. See `[LICENSE](LICENSE)`.
