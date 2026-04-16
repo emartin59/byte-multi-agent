@@ -142,4 +142,4 @@ Developed using TPUs provided by the Google TPU Research Cloud (TRC) program. Th
 
 ## License
 
-MIT. See `[LICENSE](LICENSE)`.
+MIT. See [LICENSE](LICENSE).
