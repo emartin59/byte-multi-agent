@@ -78,9 +78,10 @@ CHAR_MAP = {
 for i in range(26):
     CHAR_MAP[i + WRITE_OFFSET] = chr(97 + i)   # a-z
     CHAR_MAP[i + SPEAK_OFFSET] = chr(65 + i)   # A-Z (display-only)
+_TOOL_CHARS = "0123456789!@#$%^&*()_+-=[]{};:<>?/|\\"
 for i in range(TOOL_START, TOOL_END):
     # Display tools as digits and symbols
-    CHAR_MAP[i] = "0123456789!@#$%^&*()_+-=[]{};:<>?/|\\"[(i - TOOL_START) % 37]
+    CHAR_MAP[i] = _TOOL_CHARS[(i - TOOL_START) % len(_TOOL_CHARS)]
 
 # --- Environment ---
 VISION_RADIUS = 7
@@ -1026,8 +1027,11 @@ def main():
 
     num_devices = jax.device_count()
     print(f"Using {num_devices} device(s)")
-    assert POP_SIZE % (2 * num_devices) == 0, \
-        f"POP_SIZE ({POP_SIZE}) must be divisible by 2*num_devices ({2*num_devices})"
+    assert POP_SIZE % num_devices == 0, \
+        f"POP_SIZE ({POP_SIZE}) must be divisible by num_devices ({num_devices})"
+    assert (POP_SIZE // 2) % num_devices == 0, \
+        f"half_pop ({POP_SIZE//2}) must be divisible by num_devices ({num_devices}) "\
+        f"so that pos/neg blocks align with device boundaries"
 
     mesh = Mesh(np.array(jax.devices()).reshape(num_devices), axis_names=('pop',))
 
@@ -1091,28 +1095,32 @@ def main():
     grid_size = GRID_SIZE
     num_active = INITIAL_ACTIVE
     half_pop = POP_SIZE // 2
-    per_device_half = half_pop // num_devices
+    per_device = POP_SIZE // num_devices
 
     print(f"Population: {POP_SIZE} mirrored, {NUM_ENVS_PER_MEMBER} envs each")
     print(f"Arena: {arena_h}x{arena_w}, grid {grid_size}, agents {num_active}")
-    print(f"Per-device members: {2 * per_device_half}")
+    print(f"Per-device members: {per_device}")
     print()
 
     print("  Compiling sharded generation fn...")
 
-    # Sharded evaluation: each device evaluates POP_SIZE/num_devices members.
-    # Input partitioning: noise sharded on pop dim, center replicated,
-    # env_keys sharded on pop dim.
+    # Sharded evaluation. To keep sharding simple and correct, every sharded
+    # input has leading axis = POP_SIZE. shard_map on the 'pop' axis gives
+    # each device a contiguous slice of size POP_SIZE / num_devices.
+    #
+    # full_noise has shape (POP_SIZE, num_params_total), where the first
+    # half_pop rows are positive perturbations and the second half_pop are
+    # the negations. Perturbed params are constructed inside the sharded fn.
     @partial(shard_map, mesh=mesh,
              in_specs=(P(), P('pop'), P(), P('pop'), P('pop')),
              out_specs=P('pop'),
              check_rep=False)
-    def sharded_eval(center, noise_shard, sigma_val, env_keys_shard, ep_keys_shard):
-        # noise_shard: (half_pop/num_devices, num_params_total)
-        pos_p = center[None, :] + sigma_val * noise_shard
-        neg_p = center[None, :] - sigma_val * noise_shard
-        all_members = jnp.concatenate([pos_p, neg_p], axis=0)  # 2*per_device_half
-        # env_keys_shard and ep_keys_shard have leading dim 2*per_device_half
+    def sharded_eval(center, full_noise_shard, sigma_val,
+                     env_keys_shard, ep_keys_shard):
+        # full_noise_shard: (POP_SIZE/num_devices, num_params_total)
+        # env_keys_shard:    (POP_SIZE/num_devices, NUM_ENVS_PER_MEMBER, 2)
+        # ep_keys_shard:     (POP_SIZE/num_devices, NUM_ENVS_PER_MEMBER, 2)
+        all_members = center[None, :] + sigma_val * full_noise_shard
         fits = vmap(lambda p, eks, pks: evaluate_member(
             p, center, params_template_single, apply_fn,
             eks, pks, grid_size, arena_h, arena_w, num_active))(
@@ -1139,54 +1147,23 @@ def main():
         sigma = noise_ctrl.get_sigma()
         sigma_jnp = jnp.float32(sigma)
 
-        # Generate mirrored noise: only need half_pop actual vectors; mirror in eval
+        # Generate antithetic/mirrored noise: half_pop unique rows, then negated
         noise = random.normal(k_noise, (half_pop, num_params_total))
+        full_noise = jnp.concatenate([noise, -noise], axis=0)  # (POP_SIZE, num_params)
 
-        # Env keys: one per (member, env) pair, but members are mirrored, so
-        # pos and neg share env keys to reduce variance.
-        env_keys = random.split(k_env, POP_SIZE * NUM_ENVS_PER_MEMBER)
-        # Reshape to (POP_SIZE, NUM_ENVS_PER_MEMBER, 2) then split per device
-        env_keys_pop = env_keys.reshape(POP_SIZE, NUM_ENVS_PER_MEMBER, 2)
-        ep_keys = random.split(k_ep, POP_SIZE * NUM_ENVS_PER_MEMBER)
-        ep_keys_pop = ep_keys.reshape(POP_SIZE, NUM_ENVS_PER_MEMBER, 2)
+        # Env keys and episode keys, one per (member, env) pair.
+        # Mirrored members share keys for variance reduction.
+        env_keys = random.split(k_env, half_pop * NUM_ENVS_PER_MEMBER).reshape(
+            half_pop, NUM_ENVS_PER_MEMBER, 2)
+        env_keys_full = jnp.concatenate([env_keys, env_keys], axis=0)  # (POP_SIZE, NUM_ENVS, 2)
 
-        # Reorder so that per-device shard gets a contiguous block of members
-        # where each device handles [pos_block, neg_block] of its slice.
-        # Simplest: interleave pos and neg such that shard_map on 'pop' sees
-        # (2*per_device_half) members per device.
-        # To do this: arrange noise as (num_devices, 2*per_device_half, num_params).
-        # Take noise[i*per_device_half:(i+1)*per_device_half] as positive,
-        # and mirror inside sharded_eval.
-        noise_reshaped = noise.reshape(num_devices, per_device_half, num_params_total)
+        ep_keys = random.split(k_ep, half_pop * NUM_ENVS_PER_MEMBER).reshape(
+            half_pop, NUM_ENVS_PER_MEMBER, 2)
+        ep_keys_full = jnp.concatenate([ep_keys, ep_keys], axis=0)
 
-        # env_keys_pop is (POP_SIZE, NUM_ENVS, 2). Reorder:
-        # pos_members are [0..half_pop), neg_members are [half_pop..POP_SIZE).
-        # Each device i gets pos [i*per_half..(i+1)*per_half) AND neg [half+i*per_half..half+(i+1)*per_half).
-        # We concat pos and neg along member axis, per device.
-        pos_env_keys = env_keys_pop[:half_pop]
-        neg_env_keys = env_keys_pop[half_pop:]
-        pos_env_keys_dev = pos_env_keys.reshape(num_devices, per_device_half, NUM_ENVS_PER_MEMBER, 2)
-        neg_env_keys_dev = neg_env_keys.reshape(num_devices, per_device_half, NUM_ENVS_PER_MEMBER, 2)
-        env_keys_dev = jnp.concatenate([pos_env_keys_dev, neg_env_keys_dev], axis=1)
-        env_keys_dev = env_keys_dev.reshape(num_devices * 2 * per_device_half,
-                                              NUM_ENVS_PER_MEMBER, 2)
-
-        pos_ep_keys = ep_keys_pop[:half_pop]
-        neg_ep_keys = ep_keys_pop[half_pop:]
-        pos_ep_keys_dev = pos_ep_keys.reshape(num_devices, per_device_half, NUM_ENVS_PER_MEMBER, 2)
-        neg_ep_keys_dev = neg_ep_keys.reshape(num_devices, per_device_half, NUM_ENVS_PER_MEMBER, 2)
-        ep_keys_dev = jnp.concatenate([pos_ep_keys_dev, neg_ep_keys_dev], axis=1)
-        ep_keys_dev = ep_keys_dev.reshape(num_devices * 2 * per_device_half,
-                                            NUM_ENVS_PER_MEMBER, 2)
-
-        fitness_dev = sharded_eval(center_flat, noise_reshaped, sigma_jnp,
-                                    env_keys_dev, ep_keys_dev)
-        # fitness_dev is (POP_SIZE,). But order is per-device [pos|neg] blocks.
-        # Reconstruct canonical [pos_all, neg_all] order:
-        fitness_dev_reshaped = fitness_dev.reshape(num_devices, 2 * per_device_half)
-        pos_fits = fitness_dev_reshaped[:, :per_device_half].reshape(half_pop)
-        neg_fits = fitness_dev_reshaped[:, per_device_half:].reshape(half_pop)
-        fitness = jnp.concatenate([pos_fits, neg_fits])
+        fitness = sharded_eval(center_flat, full_noise, sigma_jnp,
+                                env_keys_full, ep_keys_full)
+        # fitness: (POP_SIZE,) with first half = positive, second half = negative
 
         center_flat, opt_state = es_update_jit(center_flat, noise, sigma_jnp,
                                                 fitness, opt_state)
